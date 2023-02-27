@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 
+"""
+datadog-dte-outage - Scrapes https://outagemap.dteenergy.com & sends Datadog metrics
+"""
+
 from datetime import datetime
 import time
 import logging
@@ -18,37 +22,47 @@ LOG = logging.getLogger("datadog-dte-outage")
 DATADOG_FLUSH_SECONDS = 10
 
 def get_json(url):
+    """
+    get_json takes a URl and returns the JSON data
+    """
     retries = 10
-    for n in range(retries):
+    for retry in range(retries):
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             response.raise_for_status()
             break
 
         except requests.HTTPError as exc:
             code = exc.response.status_code
-            LOG.error("Failed fetching %s : %s",url, code)            
+            LOG.error("Failed fetching %s : %s",url, code)
             if code in [429, 500, 502, 503, 504]:
                 # retry after n seconds
-                time.sleep(n)
+                time.sleep(retry)
                 continue
             raise
     return response.json()
 
 
 def get_interval():
+    """
+    get_interval returns the current data generation interval UUID 
+    """
+    # pylint: disable=line-too-long
     interval_url = 'https://kubra.io/stormcenter/api/v1/stormcenters/4fbb3ad3-e01d-4d71-9575-d453769c1171/views/8ed2824a-bd92-474e-a7c4-848b812b7f9b/currentState?preview=false'
     json_data = get_json(interval_url)
     return json_data['data']['interval_generation_data']
 
 
 def get_outage_data(interval_uuid):
+    """
+    get_outage_data returns a list of Datadog MetricSeries for all outage data
+    """
     outage_data = []
     # thematic-1 is by county
     # thematic-2 is by zip code
     data_sources = {
-        'county': 'https://kubra.io/{}/public/thematic-1/thematic_areas.json'.format(interval_uuid),
-        'zip_code': 'https://kubra.io/{}/public/thematic-2/thematic_areas.json'.format(interval_uuid)
+        'county': f"https://kubra.io/{interval_uuid}/public/thematic-1/thematic_areas.json",
+        'zip_code': f"https://kubra.io/{interval_uuid}/public/thematic-2/thematic_areas.json"
     }
 
     for source, target in data_sources.items():
@@ -96,6 +110,9 @@ def get_outage_data(interval_uuid):
 
 
 def submit_outage_data(outage_data):
+    """
+    submit_outage_data sends a list of MetricSeries to Datadag
+    """
     dd_config = Configuration()
     body = MetricPayload(
         series=outage_data,
@@ -110,6 +127,9 @@ def submit_outage_data(outage_data):
 
 
 def main():
+    """
+    main does the thing
+    """
     logging.basicConfig(level=logging.INFO)
     while True:
         LOG.info("Starting DTE Outage metric collection")
@@ -121,4 +141,4 @@ def main():
 
 
 if __name__ == '__main__':
-  main()
+    main()
