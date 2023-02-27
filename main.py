@@ -15,6 +15,10 @@ from datadog_api_client.v2.model.metric_payload import MetricPayload
 from datadog_api_client.v2.model.metric_point import MetricPoint
 from datadog_api_client.v2.model.metric_resource import MetricResource
 from datadog_api_client.v2.model.metric_series import MetricSeries
+from datadog_api_client.v1.api.service_checks_api import ServiceChecksApi
+from datadog_api_client.v1.model.service_check import ServiceCheck
+from datadog_api_client.v1.model.service_check_status import ServiceCheckStatus
+from datadog_api_client.v1.model.service_checks import ServiceChecks
 
 import requests
 
@@ -120,10 +124,34 @@ def submit_outage_data(outage_data):
 
     with ApiClient(dd_config) as api_client:
         api_instance = MetricsApi(api_client)
-        LOG.info("Submitting %s metrics.", len(outage_data))
+        LOG.info("Submitting %s metrics", len(outage_data))
         response = api_instance.submit_metrics(body=body)
         if response['errors']:
             LOG.error("Error submitting metrics: %s", response['errors'])
+
+
+def submit_health_check():
+    """
+    submit_health_check sends a Service Check for monitoring 
+    """
+    body = ServiceChecks(
+        [
+            ServiceCheck(
+                check="dte.outage.ok",
+                host_name="dte-outage",
+                status=ServiceCheckStatus.OK,
+                tags=[],
+            ),
+        ]
+    )
+
+    configuration = Configuration()
+    with ApiClient(configuration) as api_client:
+        api_instance = ServiceChecksApi(api_client)
+        LOG.info("Submitting health check")
+        response = api_instance.submit_service_check(body=body)
+        if response['status'] != 'ok':
+            LOG.error("Error submitting service check: %s", response['status'])
 
 
 def main():
@@ -136,6 +164,7 @@ def main():
         interval_uuid = get_interval()
         outage_data = get_outage_data(interval_uuid)
         submit_outage_data(outage_data)
+        submit_health_check()
         LOG.info("Finished DTE Outage metric collection, waiting %s seconds", DATADOG_FLUSH_SECONDS)
         time.sleep(DATADOG_FLUSH_SECONDS)
 
