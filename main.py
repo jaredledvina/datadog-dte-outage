@@ -43,7 +43,7 @@ def get_json(url):
                 time.sleep(retry)
                 continue
             raise
-        except requests.exceptions.Timeout as exc:
+        except (requests.exceptions.Timeout, TimeoutError) as exc:
             LOG.error("Timed out fetching %s ", url)
             LOG.error(exc, exc_info=True)
             time.sleep(retry)
