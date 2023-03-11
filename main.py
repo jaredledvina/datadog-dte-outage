@@ -35,15 +35,19 @@ def get_json(url):
             response = requests.get(url, timeout=5)
             response.raise_for_status()
             break
-
-        except requests.HTTPError as exc:
+        except requests.exceptions.HTTPError as exc:
             code = exc.response.status_code
-            LOG.error("Failed fetching %s : %s",url, code)
+            LOG.error("Failed fetching %s : %s", url, code)
             if code in [429, 500, 502, 503, 504]:
                 # retry after n seconds
                 time.sleep(retry)
                 continue
             raise
+        except requests.exceptions.Timeout as exc:
+            LOG.error("Timed out fetching %s ", url)
+            LOG.error(exc, exc_info=True)
+            time.sleep(retry)
+            continue
     return response.json()
 
 
