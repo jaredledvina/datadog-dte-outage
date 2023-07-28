@@ -118,9 +118,7 @@ def get_outage_data(interval_uuid):
     situations = "https://outage.dteenergy.com/situations.json"
     LOG.info("Fetching %s data", situations)
     json_data = get_json(situations)
-    #TODO: Set to lastUpdated in json
     fetch_timestamp = int(datetime.now().timestamp())
-    print(json_data)
     for metric, metric_value in json_data.items():
         if metric not in ["lastUpdated", "currentSituations"]:
             outage_data.append(MetricSeries(
