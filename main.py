@@ -53,7 +53,7 @@ def get_json(url):
 
 def get_interval():
     """
-    get_interval returns the current data generation interval UUID 
+    get_interval returns the current data generation interval UUID
     """
     # pylint: disable=line-too-long
     interval_url = 'https://kubra.io/stormcenter/api/v1/stormcenters/4fbb3ad3-e01d-4d71-9575-d453769c1171/views/8ed2824a-bd92-474e-a7c4-848b812b7f9b/currentState?preview=false'
@@ -114,6 +114,51 @@ def get_outage_data(interval_uuid):
                     ),
                 ],
             ))
+
+    situations = "https://outage.dteenergy.com/situations.json"
+    LOG.info("Fetching %s data", situations)
+    json_data = get_json(situations)
+    #TODO: Set to lastUpdated in json
+    fetch_timestamp = int(datetime.now().timestamp())
+    print(json_data)
+    for metric, metric_value in json_data.items():
+        if metric not in ["lastUpdated", "currentSituations"]:
+            outage_data.append(MetricSeries(
+                metric='dte.outage.situations.' + metric,
+                type=MetricIntakeType.GAUGE,
+                points=[
+                    MetricPoint(
+                        timestamp=fetch_timestamp,
+                        value=float(metric_value),
+                    ),
+                ],
+                tags=[ metric + ':' + metric_value ],
+                resources=[
+                    MetricResource(
+                        name="dte-outage",
+                        type="host",
+                    ),
+                ],
+            ))
+    for situations in json_data['currentSituations']:
+        outage_data.append(MetricSeries(
+            metric='dte.outage.situations.' + situations['key'],
+            type=MetricIntakeType.GAUGE,
+            points=[
+                MetricPoint(
+                    timestamp=fetch_timestamp,
+                    value=float(situations['displayValue']),
+                ),
+            ],
+            tags=[ 'currentSituations:' + situations['key'] ],
+            resources=[
+                MetricResource(
+                    name="dte-outage",
+                    type="host",
+                ),
+            ],
+        ))
+
     return outage_data
 
 
@@ -136,7 +181,7 @@ def submit_outage_data(outage_data):
 
 def submit_health_check():
     """
-    submit_health_check sends a Service Check for monitoring 
+    submit_health_check sends a Service Check for monitoring
     """
     body = ServiceChecks(
         [
