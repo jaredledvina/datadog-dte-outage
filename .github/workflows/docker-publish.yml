@@ -79,5 +79,5 @@ jobs:
           done
           cosign sign --yes ${images}
           cosign verify ${images} \
-          --certificate-identity=https://github.com/jaredledvina/datadog-dte-outage/.github/workflows/docker-publish@refs/heads/main \
+          --certificate-identity=https://github.com/jaredledvina/datadog-dte-outage/.github/workflows/docker-publish.yml@refs/heads/main \
           --certificate-oidc-issuer=https://token.actions.githubusercontent.com
