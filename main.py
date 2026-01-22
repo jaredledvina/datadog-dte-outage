@@ -1,235 +1,297 @@
 #!/usr/bin/env python
+"""Scrapes https://outagemap.dteenergy.com and sends metrics to Datadog."""
 
-"""
-datadog-dte-outage - Scrapes https://outagemap.dteenergy.com & sends Datadog metrics
-"""
-
-from datetime import datetime
-import os
-import time
 import logging
+import os
+import random
+import signal
+import time
+from datetime import datetime
 
+from curl_cffi import CurlError
+from curl_cffi import requests as curl_requests
 from datadog_api_client import ApiClient, Configuration
+from datadog_api_client.v1.api.service_checks_api import ServiceChecksApi
+from datadog_api_client.v1.model.service_check import ServiceCheck
+from datadog_api_client.v1.model.service_check_status import ServiceCheckStatus
+from datadog_api_client.v1.model.service_checks import ServiceChecks
 from datadog_api_client.v2.api.metrics_api import MetricsApi
 from datadog_api_client.v2.model.metric_intake_type import MetricIntakeType
 from datadog_api_client.v2.model.metric_payload import MetricPayload
 from datadog_api_client.v2.model.metric_point import MetricPoint
 from datadog_api_client.v2.model.metric_resource import MetricResource
 from datadog_api_client.v2.model.metric_series import MetricSeries
-from datadog_api_client.v1.api.service_checks_api import ServiceChecksApi
-from datadog_api_client.v1.model.service_check import ServiceCheck
-from datadog_api_client.v1.model.service_check_status import ServiceCheckStatus
-from datadog_api_client.v1.model.service_checks import ServiceChecks
 
-import requests
-
-LOG = logging.getLogger("datadog-dte-outage")
-DATADOG_FLUSH_SECONDS = 10
+# Configuration
 VERSION = os.environ.get("APP_VERSION", "dev")
+POLL_INTERVAL = 10
+MAX_RETRIES = 5
+REQUEST_TIMEOUT = 10
+MAX_CONSECUTIVE_FAILURES = 10
+CIRCUIT_BREAKER_COOLDOWN = 300
+
+# API endpoints
+KUBRA_STATE_URL = (
+    "https://kubra.io/stormcenter/api/v1/stormcenters/"
+    "4fbb3ad3-e01d-4d71-9575-d453769c1171/views/"
+    "8ed2824a-bd92-474e-a7c4-848b812b7f9b/currentState?preview=false"
+)
+DTE_SITUATIONS_URL = "https://outage.dteenergy.com/situations.json"
+
+# Shared resource for all metrics
+METRIC_RESOURCE = MetricResource(name="dte-outage", type="host")
+
+# Browser headers to avoid bot detection
 REQUEST_HEADERS = {
-    "User-Agent": f"datadog-dte-outage/{VERSION} (+https://github.com/jaredledvina/datadog-dte-outage)"
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://outage.dteenergy.com/",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
 
-def get_json(url):
-    """
-    get_json takes a URl and returns the JSON data
-    """
-    retries = 10
-    last_exception = None
-    for retry in range(retries):
-        try:
-            response = requests.get(url, timeout=5, headers=REQUEST_HEADERS)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as exc:
-            code = exc.response.status_code
-            LOG.error("Failed fetching %s : %s", url, code)
-            if code in [429, 500, 502, 503, 504]:
-                # retry after n seconds
-                last_exception = exc
-                time.sleep(retry)
-                continue
-            raise
-        except (requests.exceptions.Timeout, TimeoutError) as exc:
-            LOG.error("Timed out fetching %s ", url)
-            LOG.error(exc, exc_info=True)
-            last_exception = exc
-            time.sleep(retry)
-            continue
-        except requests.exceptions.JSONDecodeError as exc:
-            LOG.error("Invalid JSON from %s (status %s): %s",
-                      url, response.status_code, response.text[:200])
-            last_exception = exc
-            time.sleep(retry)
-            continue
-    raise last_exception or RuntimeError(f"Failed to fetch {url} after {retries} retries")
+LOG = logging.getLogger("datadog-dte-outage")
+
+# Module state
+_session = None
+_etag_cache = {}
+_consecutive_failures = 0
+_shutdown_requested = False
 
 
-def get_interval():
-    """
-    get_interval returns the current data generation interval UUID
-    """
-    # pylint: disable=line-too-long
-    interval_url = 'https://kubra.io/stormcenter/api/v1/stormcenters/4fbb3ad3-e01d-4d71-9575-d453769c1171/views/8ed2824a-bd92-474e-a7c4-848b812b7f9b/currentState?preview=false'
-    json_data = get_json(interval_url)
-    return json_data['data']['interval_generation_data']
+def _get_session():
+    """Get or create the HTTP session with browser impersonation."""
+    global _session
+    if _session is None:
+        _session = curl_requests.Session()
+        _session.headers.update(REQUEST_HEADERS)
+    return _session
 
 
-def get_outage_data(interval_uuid):
-    """
-    get_outage_data returns a list of Datadog MetricSeries for all outage data
-    """
-    outage_data = []
-    # thematic-1 is by county
-    # thematic-2 is by zip code
-    data_sources = {
-        'county': f"https://kubra.io/{interval_uuid}/public/thematic-1/thematic_areas.json",
-        'zip_code': f"https://kubra.io/{interval_uuid}/public/thematic-2/thematic_areas.json"
-    }
-
-    for source, target in data_sources.items():
-        LOG.info("Fetching %s data", source)
-        json_data = get_json(target)
-        fetch_timestamp = int(datetime.now().timestamp())
-
-        for data in json_data['file_data']:
-            resource = data['desc']['name']
-            outage_data.append(MetricSeries(
-                metric='dte.outage.' + source + '.' + 'current',
-                type=MetricIntakeType.GAUGE,
-                points=[
-                    MetricPoint(
-                        timestamp=fetch_timestamp,
-                        value=data['desc']['cust_a']['val'],
-                    ),
-                ],
-                tags=[ source + ':' + resource ],
-                resources=[
-                    MetricResource(
-                        name="dte-outage",
-                        type="host",
-                    ),
-                ],
-            ))
-            outage_data.append(MetricSeries(
-                metric='dte.outage.' + source + '.' + 'total',
-                type=MetricIntakeType.GAUGE,
-                points=[
-                    MetricPoint(
-                        timestamp=fetch_timestamp,
-                        value=data['desc']['cust_s'],
-                    ),
-                ],
-                tags=[ source + ':' + resource ],
-                resources=[
-                    MetricResource(
-                        name="dte-outage",
-                        type="host",
-                    ),
-                ],
-            ))
-
-    situations = "https://outage.dteenergy.com/situations.json"
-    LOG.info("Fetching %s data", situations)
-    json_data = get_json(situations)
-    fetch_timestamp = int(datetime.now().timestamp())
-    for metric, metric_value in json_data.items():
-        if metric not in ["lastUpdated", "currentSituations"]:
-            outage_data.append(MetricSeries(
-                metric='dte.outage.situations.' + metric,
-                type=MetricIntakeType.GAUGE,
-                points=[
-                    MetricPoint(
-                        timestamp=fetch_timestamp,
-                        value=float(metric_value),
-                    ),
-                ],
-                tags=[ metric + ':' + metric_value ],
-                resources=[
-                    MetricResource(
-                        name="dte-outage",
-                        type="host",
-                    ),
-                ],
-            ))
-    for situations in json_data['currentSituations']:
-        outage_data.append(MetricSeries(
-            metric='dte.outage.situations.' + situations['key'],
-            type=MetricIntakeType.GAUGE,
-            points=[
-                MetricPoint(
-                    timestamp=fetch_timestamp,
-                    value=float(situations['displayValue']),
-                ),
-            ],
-            tags=[ 'currentSituations:' + situations['key'] ],
-            resources=[
-                MetricResource(
-                    name="dte-outage",
-                    type="host",
-                ),
-            ],
-        ))
-
-    return outage_data
+def _handle_shutdown(signum, frame):
+    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    global _shutdown_requested
+    LOG.info("Shutdown signal received, finishing current cycle...")
+    _shutdown_requested = True
 
 
-def submit_outage_data(outage_data):
-    """
-    submit_outage_data sends a list of MetricSeries to Datadag
-    """
-    dd_config = Configuration()
-    body = MetricPayload(
-        series=outage_data,
+def create_metric(name, value, timestamp, tags):
+    """Create a Datadog MetricSeries with common defaults."""
+    return MetricSeries(
+        metric=name,
+        type=MetricIntakeType.GAUGE,
+        points=[MetricPoint(timestamp=timestamp, value=float(value))],
+        tags=tags,
+        resources=[METRIC_RESOURCE],
     )
 
-    with ApiClient(dd_config) as api_client:
-        api_instance = MetricsApi(api_client)
-        LOG.info("Submitting %s metrics", len(outage_data))
-        response = api_instance.submit_metrics(body=body)
-        if response['errors']:
-            LOG.error("Error submitting metrics: %s", response['errors'])
+
+def fetch_json(url):
+    """
+    Fetch JSON from a URL with retries, caching, and bot detection avoidance.
+
+    Uses Chrome TLS fingerprint impersonation and conditional requests via ETags.
+    """
+    global _consecutive_failures
+
+    cached = _etag_cache.get(url, {})
+    session = _get_session()
+
+    # Small random delay to appear more human
+    time.sleep(random.uniform(0.5, 1.5))
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            headers = {"If-None-Match": cached["etag"]} if "etag" in cached else {}
+            response = session.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                headers=headers,
+                impersonate="chrome131",
+            )
+
+            # Return cached data if not modified
+            if response.status_code == 304 and "data" in cached:
+                LOG.debug("Using cached data for %s", url)
+                _consecutive_failures = 0
+                return cached["data"]
+
+            response.raise_for_status()
+
+            # Detect bot protection (HTML instead of JSON)
+            content_type = response.headers.get("content-type", "")
+            if "html" in content_type.lower():
+                raise ValueError(f"Received HTML instead of JSON: {response.text[:200]}")
+
+            data = response.json()
+
+            # Cache response with ETag if available
+            if "etag" in response.headers:
+                _etag_cache[url] = {"etag": response.headers["etag"], "data": data}
+
+            _consecutive_failures = 0
+            return data
+
+        except curl_requests.HTTPError as exc:
+            status = exc.response.status_code
+            LOG.error("HTTP %s fetching %s", status, url)
+
+            if status in {429, 500, 502, 503, 504}:
+                last_error = exc
+                retry_after = exc.response.headers.get("Retry-After")
+                sleep_time = int(retry_after) if retry_after else min(2 ** attempt, 60)
+                LOG.info("Retrying in %ss...", sleep_time)
+                time.sleep(sleep_time)
+                continue
+            raise
+
+        except (CurlError, TimeoutError, ValueError, curl_requests.JSONDecodeError) as exc:
+            LOG.error("Error fetching %s: %s", url, exc)
+            last_error = exc
+            time.sleep(min(2 ** attempt, 60))
+            continue
+
+    _consecutive_failures += 1
+    raise last_error or RuntimeError(f"Failed to fetch {url} after {MAX_RETRIES} retries")
+
+
+def collect_outage_metrics():
+    """Collect all outage metrics from DTE APIs."""
+    metrics = []
+    timestamp = int(datetime.now().timestamp())
+
+    # Get current interval UUID for Kubra API
+    state = fetch_json(KUBRA_STATE_URL)
+    interval_uuid = state["data"]["interval_generation_data"]
+
+    # Collect county and zip code data
+    sources = {
+        "county": f"https://kubra.io/{interval_uuid}/public/thematic-1/thematic_areas.json",
+        "zip_code": f"https://kubra.io/{interval_uuid}/public/thematic-2/thematic_areas.json",
+    }
+
+    for source_name, url in sources.items():
+        LOG.info("Fetching %s data", source_name)
+        data = fetch_json(url)
+
+        for area in data["file_data"]:
+            name = area["desc"]["name"]
+            tag = f"{source_name}:{name}"
+
+            metrics.append(create_metric(
+                f"dte.outage.{source_name}.current",
+                area["desc"]["cust_a"]["val"],
+                timestamp,
+                [tag],
+            ))
+            metrics.append(create_metric(
+                f"dte.outage.{source_name}.total",
+                area["desc"]["cust_s"],
+                timestamp,
+                [tag],
+            ))
+
+    # Collect situation summary data
+    LOG.info("Fetching situations data")
+    situations = fetch_json(DTE_SITUATIONS_URL)
+
+    for key, value in situations.items():
+        if key not in {"lastUpdated", "currentSituations"}:
+            metrics.append(create_metric(
+                f"dte.outage.situations.{key}",
+                value,
+                timestamp,
+                [f"{key}:{value}"],
+            ))
+
+    for situation in situations["currentSituations"]:
+        metrics.append(create_metric(
+            f"dte.outage.situations.{situation['key']}",
+            situation["displayValue"],
+            timestamp,
+            [f"currentSituations:{situation['key']}"],
+        ))
+
+    return metrics
+
+
+def submit_metrics(metrics):
+    """Submit metrics to Datadog."""
+    config = Configuration()
+    with ApiClient(config) as client:
+        api = MetricsApi(client)
+        LOG.info("Submitting %s metrics", len(metrics))
+        response = api.submit_metrics(body=MetricPayload(series=metrics))
+        if response.get("errors"):
+            LOG.error("Error submitting metrics: %s", response["errors"])
 
 
 def submit_health_check():
-    """
-    submit_health_check sends a Service Check for monitoring
-    """
-    body = ServiceChecks(
-        [
-            ServiceCheck(
-                check="dte.outage.ok",
-                host_name="dte-outage",
-                status=ServiceCheckStatus.OK,
-                tags=[],
-            ),
-        ]
-    )
-
-    configuration = Configuration()
-    with ApiClient(configuration) as api_client:
-        api_instance = ServiceChecksApi(api_client)
+    """Submit health check to Datadog."""
+    config = Configuration()
+    body = ServiceChecks([
+        ServiceCheck(
+            check="dte.outage.ok",
+            host_name="dte-outage",
+            status=ServiceCheckStatus.OK,
+            tags=[],
+        )
+    ])
+    with ApiClient(config) as client:
+        api = ServiceChecksApi(client)
         LOG.info("Submitting health check")
-        response = api_instance.submit_service_check(body=body)
-        if response['status'] != 'ok':
-            LOG.error("Error submitting service check: %s", response['status'])
+        response = api.submit_service_check(body=body)
+        if response.get("status") != "ok":
+            LOG.error("Error submitting health check: %s", response.get("status"))
 
 
 def main():
-    """
-    main does the thing
-    """
+    """Main collection loop."""
+    global _consecutive_failures
+
     logging.basicConfig(level=logging.INFO)
-    LOG.info("datadog-dte-outage version %s starting", VERSION)
-    while True:
-        LOG.info("Starting DTE Outage metric collection")
-        interval_uuid = get_interval()
-        outage_data = get_outage_data(interval_uuid)
-        submit_outage_data(outage_data)
-        submit_health_check()
-        LOG.info("Finished DTE Outage metric collection, waiting %s seconds", DATADOG_FLUSH_SECONDS)
-        time.sleep(DATADOG_FLUSH_SECONDS)
+    LOG.info("datadog-dte-outage %s starting", VERSION)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+    while not _shutdown_requested:
+        # Circuit breaker
+        if _consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            LOG.warning(
+                "Circuit breaker: %s failures, cooling down %ss",
+                _consecutive_failures,
+                CIRCUIT_BREAKER_COOLDOWN,
+            )
+            time.sleep(CIRCUIT_BREAKER_COOLDOWN)
+            _consecutive_failures = 0
+
+        try:
+            LOG.info("Starting collection cycle")
+            metrics = collect_outage_metrics()
+
+            if metrics:
+                submit_metrics(metrics)
+                submit_health_check()
+            else:
+                LOG.warning("No metrics collected")
+
+        except Exception as exc:
+            LOG.error("Collection failed: %s", exc, exc_info=True)
+            _consecutive_failures += 1
+
+        # Sleep with jitter
+        sleep_time = POLL_INTERVAL + random.uniform(-2, 2)
+        LOG.info("Next collection in %.1fs", sleep_time)
+        time.sleep(sleep_time)
+
+    LOG.info("Shutdown complete")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
