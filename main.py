@@ -24,6 +24,9 @@ import requests
 
 LOG = logging.getLogger("datadog-dte-outage")
 DATADOG_FLUSH_SECONDS = 10
+REQUEST_HEADERS = {
+    "User-Agent": "datadog-dte-outage/1.0 (+https://github.com/jaredledvina/datadog-dte-outage)"
+}
 
 def get_json(url):
     """
@@ -33,7 +36,7 @@ def get_json(url):
     last_exception = None
     for retry in range(retries):
         try:
-            response = requests.get(url, timeout=5)
+            response = requests.get(url, timeout=5, headers=REQUEST_HEADERS)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as exc:
