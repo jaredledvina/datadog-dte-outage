@@ -1,0 +1,16 @@
+[project]
+name = "datadog-dte-outage"
+version = "1.0.0"
+description = "Scrapes https://outagemap.dteenergy.com & sends Datadog metrics"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "requests",
+    "datadog-api-client",
+]
+
+[dependency-groups]
+dev = [
+    "pylint",
+]
