@@ -30,25 +30,34 @@ def get_json(url):
     get_json takes a URl and returns the JSON data
     """
     retries = 10
+    last_exception = None
     for retry in range(retries):
         try:
             response = requests.get(url, timeout=5)
             response.raise_for_status()
-            break
+            return response.json()
         except requests.exceptions.HTTPError as exc:
             code = exc.response.status_code
             LOG.error("Failed fetching %s : %s", url, code)
             if code in [429, 500, 502, 503, 504]:
                 # retry after n seconds
+                last_exception = exc
                 time.sleep(retry)
                 continue
             raise
         except (requests.exceptions.Timeout, TimeoutError) as exc:
             LOG.error("Timed out fetching %s ", url)
             LOG.error(exc, exc_info=True)
+            last_exception = exc
             time.sleep(retry)
             continue
-    return response.json()
+        except requests.exceptions.JSONDecodeError as exc:
+            LOG.error("Invalid JSON from %s (status %s): %s",
+                      url, response.status_code, response.text[:200])
+            last_exception = exc
+            time.sleep(retry)
+            continue
+    raise last_exception or RuntimeError(f"Failed to fetch {url} after {retries} retries")
 
 
 def get_interval():
