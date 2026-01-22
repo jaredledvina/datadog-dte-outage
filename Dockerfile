@@ -26,6 +26,10 @@ FROM python:3.14-slim-bookworm
 
 WORKDIR /app
 
+# Version info from build args
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app
 

@@ -5,6 +5,7 @@ datadog-dte-outage - Scrapes https://outagemap.dteenergy.com & sends Datadog met
 """
 
 from datetime import datetime
+import os
 import time
 import logging
 
@@ -24,8 +25,9 @@ import requests
 
 LOG = logging.getLogger("datadog-dte-outage")
 DATADOG_FLUSH_SECONDS = 10
+VERSION = os.environ.get("APP_VERSION", "dev")
 REQUEST_HEADERS = {
-    "User-Agent": "datadog-dte-outage/1.0 (+https://github.com/jaredledvina/datadog-dte-outage)"
+    "User-Agent": f"datadog-dte-outage/{VERSION} (+https://github.com/jaredledvina/datadog-dte-outage)"
 }
 
 def get_json(url):
@@ -218,6 +220,7 @@ def main():
     main does the thing
     """
     logging.basicConfig(level=logging.INFO)
+    LOG.info("datadog-dte-outage version %s starting", VERSION)
     while True:
         LOG.info("Starting DTE Outage metric collection")
         interval_uuid = get_interval()
