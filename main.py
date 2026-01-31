@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Scrapes https://outagemap.dteenergy.com and sends metrics to Datadog."""
 
+import json
 import logging
 import os
 import random
@@ -10,6 +11,7 @@ from datetime import datetime
 
 from curl_cffi import CurlError
 from curl_cffi import requests as curl_requests
+from curl_cffi.requests import RequestsError
 from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.v1.api.service_checks_api import ServiceChecksApi
 from datadog_api_client.v1.model.service_check import ServiceCheck
@@ -29,6 +31,7 @@ MAX_RETRIES = 5
 REQUEST_TIMEOUT = 10
 MAX_CONSECUTIVE_FAILURES = 10
 CIRCUIT_BREAKER_COOLDOWN = 300
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 # API endpoints
 KUBRA_STATE_URL = (
@@ -121,6 +124,17 @@ def fetch_json(url):
                 _consecutive_failures = 0
                 return cached["data"]
 
+            # Handle retryable HTTP errors before raise_for_status
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                LOG.error("HTTP %s fetching %s", response.status_code, url)
+                retry_after = response.headers.get("Retry-After")
+                sleep_time = int(retry_after) if retry_after else min(2 ** attempt, 60)
+                LOG.info("Retrying in %ss...", sleep_time)
+                last_error = RequestsError(f"HTTP {response.status_code}", response=response)
+                time.sleep(sleep_time)
+                continue
+
+            # Raise for other non-success status codes (4xx errors won't be retried)
             response.raise_for_status()
 
             # Detect bot protection (HTML instead of JSON)
@@ -137,24 +151,10 @@ def fetch_json(url):
             _consecutive_failures = 0
             return data
 
-        except curl_requests.HTTPError as exc:
-            status = exc.response.status_code
-            LOG.error("HTTP %s fetching %s", status, url)
-
-            if status in {429, 500, 502, 503, 504}:
-                last_error = exc
-                retry_after = exc.response.headers.get("Retry-After")
-                sleep_time = int(retry_after) if retry_after else min(2 ** attempt, 60)
-                LOG.info("Retrying in %ss...", sleep_time)
-                time.sleep(sleep_time)
-                continue
-            raise
-
-        except (CurlError, TimeoutError, ValueError, curl_requests.JSONDecodeError) as exc:
+        except (CurlError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             LOG.error("Error fetching %s: %s", url, exc)
             last_error = exc
             time.sleep(min(2 ** attempt, 60))
-            continue
 
     _consecutive_failures += 1
     raise last_error or RuntimeError(f"Failed to fetch {url} after {MAX_RETRIES} retries")
