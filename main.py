@@ -29,6 +29,10 @@ VERSION = os.environ.get("APP_VERSION", "dev")
 POLL_INTERVAL = 10
 MAX_RETRIES = 5
 REQUEST_TIMEOUT = 10
+# (connect, read) timeouts for Datadog submissions. Without these the client
+# blocks in read() forever when a connection stalls, wedging the collection
+# loop while the container still looks healthy.
+DD_REQUEST_TIMEOUT = (10, 30)
 MAX_CONSECUTIVE_FAILURES = 10
 CIRCUIT_BREAKER_COOLDOWN = 300
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -73,6 +77,13 @@ def _get_session():
         _session = curl_requests.Session()
         _session.headers.update(REQUEST_HEADERS)
     return _session
+
+
+def _dd_config():
+    """Get a Datadog client configuration with a bounded request timeout."""
+    config = Configuration()
+    config.request_timeout = DD_REQUEST_TIMEOUT
+    return config
 
 
 def _handle_shutdown(signum, frame):
@@ -222,7 +233,7 @@ def collect_outage_metrics():
 
 def submit_metrics(metrics):
     """Submit metrics to Datadog."""
-    config = Configuration()
+    config = _dd_config()
     with ApiClient(config) as client:
         api = MetricsApi(client)
         LOG.info("Submitting %s metrics", len(metrics))
@@ -233,7 +244,7 @@ def submit_metrics(metrics):
 
 def submit_health_check():
     """Submit health check to Datadog."""
-    config = Configuration()
+    config = _dd_config()
     body = ServiceChecks([
         ServiceCheck(
             check="dte.outage.ok",
