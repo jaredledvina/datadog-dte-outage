@@ -26,6 +26,11 @@ FROM python:3.14-slim-bookworm
 
 WORKDIR /app
 
+# Pull in the current ca-certificates (eMudhra intermediate compromise, Oct 2026)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Version info from build args
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
